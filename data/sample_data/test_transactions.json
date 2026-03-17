@@ -1,0 +1,8 @@
+[
+  {
+    "transaction_id": "test1",
+    "amount": 100.0,
+    "type": "debit",
+    "timestamp": "2026-03-12T00:00:00Z"
+  }
+]

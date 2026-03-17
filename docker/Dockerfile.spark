@@ -1,0 +1,4 @@
+# Dockerfile for Apache Spark
+FROM bitnami/spark:latest
+
+# Add custom configuration or scripts here if needed

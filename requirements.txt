@@ -1,0 +1,25 @@
+# List Python dependencies for the banking-data-platform project here.pyspark==3.5.0
+pyspark==3.5.0
+kafka-python==2.0.2
+
+pandas
+numpy
+
+boto3
+s3fs
+
+snowflake-connector-python
+snowflake-sqlalchemy
+
+sqlalchemy
+psycopg2-binary
+
+great-expectations
+
+python-dotenv
+pyyaml
+
+fastparquet
+pyarrow
+
+apache-airflow

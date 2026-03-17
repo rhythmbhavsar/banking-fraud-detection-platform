@@ -1,0 +1,38 @@
+venv/
+
+# ── Environment & secrets ─────────────────────────────────────────
+.env
+*.env
+.env.*
+
+# ── Data files ────────────────────────────────────────────────────
+data/raw/
+data/processed/
+*.csv
+*.parquet
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# ── Spark ─────────────────────────────────────────────────────────
+spark-warehouse/
+derby.log
+metastore_db/
+
+# ── Airflow ───────────────────────────────────────────────────────
+logs/
+airflow.db
+airflow.cfg
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+keys/
+*.pem

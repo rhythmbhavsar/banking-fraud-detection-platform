@@ -1,0 +1,299 @@
+"""
+Airflow DAG — Bank Fraud Transaction Pipeline
+──────────────────────────────────────────────
+Orchestrates the full ETL pipeline on a daily schedule:
+
+  1. kafka_consumer_stream.py   — streams Kafka → S3 Bronze (always running)
+  2. bronze_to_silver.py        — cleans Bronze → Silver
+  3. silver_to_gold.py          — fraud detection Silver → Gold
+  4. load_transactions.py       — loads Gold → Snowflake
+  5. data quality checks        — validates row counts at each layer
+
+Schedule: Daily at 6:00 AM UTC
+Catchup : False — only runs for current day, no backfill
+
+DAG structure:
+  start
+    │
+    ▼
+  check_bronze_data
+    │
+    ▼
+  bronze_to_silver
+    │
+    ▼
+  check_silver_data
+    │
+    ▼
+  silver_to_gold
+    │
+    ▼
+  check_gold_data
+    │
+    ├──────────────────────┐
+    ▼                      ▼
+  load_snowflake      notify_success
+    │
+    ▼
+  check_snowflake
+    │
+    ▼
+  notify_success
+
+Place at: airflow/dags/transaction_pipeline_dag.py
+"""
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+import boto3
+import logging
+
+log = logging.getLogger(__name__)
+
+# ─── Default args ──────────────────────────────────────────────────────────────
+default_args = {
+    "owner":            "data-engineering",
+    "depends_on_past":  False,
+    "retries":          2,
+    "retry_delay":      timedelta(minutes=5),
+    "email_on_failure": False,
+    "email_on_retry":   False,
+}
+
+# ─── Config ────────────────────────────────────────────────────────────────────
+S3_BUCKET  = "bank-fraud-data-lake"
+AWS_REGION = "us-east-2"
+
+# Spark submit command inside the container
+SPARK_SUBMIT = (
+    "docker exec "
+    "--env AWS_ACCESS_KEY_ID={{ var.value.aws_access_key_id }} "
+    "--env AWS_SECRET_ACCESS_KEY={{ var.value.aws_secret_access_key }} "
+    "--env AWS_REGION=" + AWS_REGION + " "
+    "--env S3_BUCKET=" + S3_BUCKET + " "
+    "--env HOME=/tmp "
+    "--env IVY_HOME=/tmp/.ivy2 "
+    "spark-master "
+    "/opt/spark/bin/spark-submit "
+    "--conf spark.jars.ivy=/tmp/.ivy2 "
+    "--packages org.apache.hadoop:hadoop-aws:3.3.4,"
+    "com.amazonaws:aws-java-sdk-bundle:1.12.262 "
+)
+
+
+# ─── Helper: get partition path ────────────────────────────────────────────────
+def get_partition(layer: str, dataset: str, ds: str) -> str:
+    """Returns S3 prefix for a given layer/dataset/date."""
+    year, month, day = ds.split("-")
+    return f"{layer}/{dataset}/year={year}/month={month}/day={day}"
+
+
+# ─── Task functions ────────────────────────────────────────────────────────────
+def check_s3_data(layer: str, dataset: str, min_files: int = 1, **context):
+    """
+    Checks that at least min_files Parquet files exist in the S3 partition
+    for the execution date. Raises exception if not found — fails the task
+    and triggers Airflow retry logic.
+    """
+    ds = context["ds"]   # execution date as YYYY-MM-DD
+    prefix = get_partition(layer, dataset, ds)
+
+    log.info(f"Checking s3://{S3_BUCKET}/{prefix}")
+
+    import os
+    from airflow.models import Variable
+
+    aws_key    = Variable.get("aws_access_key_id",     default_var=os.getenv("AWS_ACCESS_KEY_ID"))
+    aws_secret = Variable.get("aws_secret_access_key", default_var=os.getenv("AWS_SECRET_ACCESS_KEY"))
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id     = aws_key,
+        aws_secret_access_key = aws_secret,
+        region_name           = AWS_REGION,
+    )
+
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+    parquet_files = [
+        obj for obj in response.get("Contents", [])
+        if obj["Key"].endswith(".parquet")
+    ]
+
+    count = len(parquet_files)
+    log.info(f"  Found {count} parquet file(s)")
+
+    if count < min_files:
+        raise ValueError(
+            f"Data quality check failed: expected >={min_files} files "
+            f"in s3://{S3_BUCKET}/{prefix}, found {count}"
+        )
+
+    log.info(f"  ✅ Data check passed for {layer}/{dataset} on {ds}")
+    return count
+
+
+def check_snowflake_counts(**context):
+    """
+    Verifies that rows were loaded into all three Snowflake tables
+    for the execution date.
+    """
+    import os
+    import snowflake.connector
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
+    ds = context["ds"]
+
+    pk_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "keys/snowflake_private_key.pem")
+    with open(pk_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(
+            f.read(), password=None, backend=default_backend()
+        )
+    pk_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+    conn = snowflake.connector.connect(
+        account     = os.getenv("SNOWFLAKE_ACCOUNT"),
+        user        = os.getenv("SNOWFLAKE_USER"),
+        private_key = pk_bytes,
+        database    = os.getenv("SNOWFLAKE_DATABASE", "BANK_FRAUD"),
+        schema      = os.getenv("SNOWFLAKE_SCHEMA",   "PUBLIC"),
+        warehouse   = os.getenv("SNOWFLAKE_WAREHOUSE","COMPUTE_WH"),
+        role        = os.getenv("SNOWFLAKE_ROLE",     "SYSADMIN"),
+    )
+
+    cur = conn.cursor()
+    results = {}
+
+    for table in ["FACT_TRANSACTIONS", "FRAUD_ALERTS", "TRANSACTION_SUMMARY"]:
+        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE TRANSACTION_DATE = '{ds}'")
+        count = cur.fetchone()[0]
+        results[table] = count
+        log.info(f"  {table}: {count:,} rows for {ds}")
+        if count == 0:
+            raise ValueError(f"No rows found in {table} for {ds}")
+
+    cur.close()
+    conn.close()
+
+    log.info(f"  ✅ Snowflake validation passed for {ds}")
+    return results
+
+
+def notify_success(**context):
+    ds = context["ds"]
+    log.info(f"""
+    ╔══════════════════════════════════════════╗
+    ║   Pipeline completed successfully!       ║
+    ║   Date     : {ds}               ║
+    ║   Bronze   : ✅ S3 raw Parquet           ║
+    ║   Silver   : ✅ S3 clean Parquet         ║
+    ║   Gold     : ✅ S3 fraud alerts          ║
+    ║   Snowflake: ✅ All tables loaded        ║
+    ╚══════════════════════════════════════════╝
+    """)
+
+
+def notify_failure(**context):
+    ds       = context["ds"]
+    task_id  = context.get("task_instance").task_id
+    log.error(f"Pipeline FAILED at task: {task_id} for date: {ds}")
+    # Add Slack / email notification here when ready
+
+
+# ─── DAG definition ────────────────────────────────────────────────────────────
+with DAG(
+    dag_id            = "bank_fraud_transaction_pipeline",
+    description       = "Daily ETL: Kafka → Bronze → Silver → Gold → Snowflake",
+    default_args      = default_args,
+    schedule_interval = "0 6 * * *",     # 6:00 AM UTC daily
+    start_date        = datetime(2026, 3, 12),
+    catchup           = False,
+    max_active_runs   = 1,               # prevent overlapping runs
+    tags              = ["fraud", "etl", "banking"],
+) as dag:
+
+    # ── Start ──────────────────────────────────────────────────────────
+    start = EmptyOperator(task_id="start")
+
+    # ── Step 1: Check Bronze data exists ───────────────────────────────
+    check_bronze = PythonOperator(
+        task_id         = "check_bronze_data",
+        python_callable = check_s3_data,
+        op_kwargs       = {"layer": "bronze", "dataset": "transactions", "min_files": 1},
+    )
+
+    # ── Step 2: Bronze → Silver ────────────────────────────────────────
+    bronze_to_silver = BashOperator(
+        task_id  = "bronze_to_silver",
+        bash_command = (
+            SPARK_SUBMIT +
+            "--env BRONZE_DATE={{ ds }} "
+            "/tmp/spark-jobs/bronze_to_silver.py"
+        ),
+    )
+
+    # ── Step 3: Check Silver data ──────────────────────────────────────
+    check_silver = PythonOperator(
+        task_id         = "check_silver_data",
+        python_callable = check_s3_data,
+        op_kwargs       = {"layer": "silver", "dataset": "transactions", "min_files": 1},
+    )
+
+    # ── Step 4: Silver → Gold ──────────────────────────────────────────
+    silver_to_gold = BashOperator(
+        task_id  = "silver_to_gold",
+        bash_command = (
+            SPARK_SUBMIT +
+            "--env SILVER_DATE={{ ds }} "
+            "/tmp/spark-jobs/silver_to_gold.py"
+        ),
+    )
+
+    # ── Step 5: Check Gold data ────────────────────────────────────────
+    check_gold = PythonOperator(
+        task_id         = "check_gold_data",
+        python_callable = check_s3_data,
+        op_kwargs       = {"layer": "gold", "dataset": "fraud_alerts", "min_files": 1},
+    )
+
+    # ── Step 6: Load → Snowflake ───────────────────────────────────────
+    load_snowflake = BashOperator(
+        task_id      = "load_snowflake",
+        bash_command = "LOAD_DATE={{ ds }} python /opt/airflow/dags/../../../warehouse/load_transactions.py",
+    )
+
+    # ── Step 7: Check Snowflake row counts ─────────────────────────────
+    check_snowflake = PythonOperator(
+        task_id         = "check_snowflake_counts",
+        python_callable = check_snowflake_counts,
+    )
+
+    # ── Step 8: Notify success ─────────────────────────────────────────
+    success = PythonOperator(
+        task_id         = "notify_success",
+        python_callable = notify_success,
+        trigger_rule    = TriggerRule.ALL_SUCCESS,
+    )
+
+    # ── Step 9: Notify failure (runs if any upstream task fails) ───────
+    failure = PythonOperator(
+        task_id         = "notify_failure",
+        python_callable = notify_failure,
+        trigger_rule    = TriggerRule.ONE_FAILED,
+    )
+
+    # ── DAG dependencies ───────────────────────────────────────────────
+    start >> check_bronze >> bronze_to_silver >> check_silver
+    check_silver >> silver_to_gold >> check_gold >> load_snowflake
+    load_snowflake >> check_snowflake >> success
+    [check_bronze, bronze_to_silver, check_silver,
+     silver_to_gold, check_gold, load_snowflake,
+     check_snowflake] >> failure
