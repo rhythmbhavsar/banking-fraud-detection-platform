@@ -2,6 +2,8 @@
 
 A production-grade, end-to-end data engineering pipeline for real-time fraud detection on financial transactions. Built on a **medallion architecture** (Bronze → Silver → Gold) using Apache Kafka, Apache Spark, AWS S3, Apache Airflow, and Snowflake.
 
+<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/c6c41ac2-bae9-44ac-bd24-f0fc0baae2c5" />
+
 ---
 
 ## 📋 Table of Contents
